@@ -1,0 +1,385 @@
+Nice — let’s build the **FairMatch PoC** step-by-step. I’ll give you a concrete, runnable plan (with commands, example code snippets, file layout, and test steps) so you can get a working demo on the Soundness testnet + Walrus. I’ll mark places where you’ll replace testnet values (keys, endpoints). I also include pointer links to docs I used. ([Soundness][1], [GitHub][2], [npm][3])
+
+---
+
+# Goal (PoC)
+
+Build a minimal FairMatch demo where:
+
+1. A **game server (issuer)** issues a **signed credential commitment** for a player (binding a player to a rank, plus a nonce).
+2. The **player** produces a **zero-knowledge proof** that they *know the preimage* (secret) that maps to that commitment and that their rank is inside a bracket (e.g., Gold). The proof **does not reveal the player id**.
+3. The proof blob is **uploaded to Walrus**, and the Soundness Layer (testnet) attests the proof. ([npm][3], [Soundness][4])
+4. The Matchmaking service collects player attestation IDs, checks they’re valid, creates a **signed lobby record** referencing those attestations, stores the lobby proof on Walrus, and starts the match.
+
+This demonstrates **provably fair matchmaking**: anyone can fetch and verify each player’s attestation + lobby signature.
+
+---
+
+# High-level architecture (PoC)
+
+Client (player browser) ⇄ Issuer (game server)
+Player → generates proof → uploads blob → Walrus → Soundness attests → Sui stores attestation → Matchmaker reads attestations → match/lobby created + stored in Walrus → Game server starts game.
+
+Soundness repo / CLI / testnet tools you’ll use for submission and keys. ([GitHub][2])
+
+---
+
+# Prerequisites (install once)
+
+(Use Linux/macOS steps; on Windows use WSL.)
+
+1. Node & npm (Node 18+ recommended)
+   `curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -`
+   `sudo apt install -y nodejs`
+
+2. Yarn (optional)
+   `npm i -g yarn`
+
+3. Rust & cargo (required for circom build and some tooling):
+   `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+
+4. circom & snarkjs (for Groth16/circom PoC):
+
+   * build circom (official): clone & cargo build per docs. Or install circom binary from docs. ([docs.circom.io][5])
+   * `npm i -g snarkjs`
+
+5. (Optional) circomlibjs (for Poseidon in JS):
+   `npm i circomlibjs ffjavascript`
+
+6. Install Walrus TypeScript SDK (client uploads):
+   `npm i @mysten/walrus` or use Tusky SDK `npm i @tusky-io/ts-sdk` (both are used in Walrus ecosystem). ([npm][3])
+
+7. Sui / Soundness tools: install the Soundness testnet tooling (soundnessup / soundness-cli). Official repo contains soundnessup and soundness-cli—use their install script from the repo. Example (from community guides):
+
+   ```bash
+   curl -sSL https://raw.githubusercontent.com/SoundnessLabs/soundness-layer/main/soundnessup/install | bash
+   source ~/.bashrc
+   soundnessup install
+   ```
+
+   Then you can run `soundness-cli` commands (generate-key, send). ([GitHub][2])
+
+> Notes: Walrus offers an Upload Relay and TypeScript SDK to simplify uploads (recommended for client demos). See Walrus SDK docs. ([npm][3])
+
+---
+
+# PoC plan — steps (concrete, numbered)
+
+### Step 0 — repo scaffold
+
+Create a repo folder:
+
+```
+fairmatch-poc/
+├─ issuer/                # Node server that issues credentials
+├─ player-client/         # React UI for player (proof gen + upload)
+├─ matchmaker/            # Node service to aggregate attestations & create lobby
+├─ circuits/              # circom circuits + build scripts
+├─ scripts/               # helpers: walrus upload, soundness-cli wrappers
+└─ README.md
+```
+
+---
+
+### Step 1 — circuit design (rank proof)
+
+**Goal:** prove knowledge of `(uid_hash, rank, salt, nonce)` such that `commit = Poseidon(uid_hash, rank, nonce, salt)` and `rank` is inside a bracket \[minRank, maxRank]. Public outputs: `commit` (blob referenced by issuer), `minRank`, `maxRank`. Secret inputs: `uid_hash`, `rank`, `nonce`, `salt`.
+
+**Why Poseidon:** ZK-friendly hash (few constraints). Use circom + circomlib (Poseidon). ([O1 Labs][6])
+
+Example `circuits/rank_proof.circom` (conceptual — you will need circomlib's Poseidon and a lessThan comparator):
+
+```circom
+pragma circom 2.0.0;
+include "circomlib/poseidon.circom";
+include "circomlib/lessThan.circom"; // or write a bit-decomp comparator
+
+template RankProof() {
+  // public
+  signal input commit;      // commitment (field element)
+  signal input minRank;
+  signal input maxRank;
+
+  // private
+  signal private input uidHash;
+  signal private input rank;
+  signal private input nonce;
+  signal private input salt;
+
+  // compute
+  component hasher = Poseidon(4);
+  hasher.inputs[0] <== uidHash;
+  hasher.inputs[1] <== rank;
+  hasher.inputs[2] <== nonce;
+  hasher.inputs[3] <== salt;
+  hasher.out[0] === commit;
+
+  // range check: minRank <= rank <= maxRank
+  component lt1 = LessThan(32); // checks minRank < rank? adjust usage
+  lt1.in[0] <== rank;
+  lt1.in[1] <== maxRank;
+  // require rank <= maxRank:
+  lt1.out === 1;
+
+  component lt2 = LessThan(32);
+  lt2.in[0] <== minRank;
+  lt2.in[1] <== rank;
+  lt2.out === 1;
+}
+component main = RankProof();
+```
+
+**Build flow (examples):**
+
+```bash
+cd circuits
+circom rank_proof.circom --r1cs --wasm -o build
+# get powers-of-tau (ptau)
+wget https://hermez.s3-eu-west-1.amazonaws.com/powersOfTau28_hez_final_12.ptau
+npx snarkjs groth16 setup build/rank_proof.r1cs powersOfTau28_hez_final_12.ptau rank_zkey.zkey
+npx snarkjs zkey export verificationkey rank_verif_key.json
+```
+
+(See circom docs for exact commands). ([docs.circom.io][5])
+
+---
+
+### Step 2 — issuer (game server) issues credential commitment
+
+**Flow:**
+
+* Server has an issuer private key (ECDSA / Ed25519).
+* When user registers or the server chooses to issue a credential, server generates `nonce` (random), computes `uidHash = H(userId)` (so server doesn’t publish userId), chooses `rank` (server side), optionally creates `salt` and returns it privately to the player, or the player generates their own `salt` and shares only the commitment components to the issuer. For PoC, a simple flow:
+
+Issuer creates:
+
+```js
+const { poseidon } = require('circomlibjs');
+const ethers = require('ethers');
+
+const uidHash = ethers.utils.keccak256(Buffer.from(userId));
+const nonce = crypto.randomBytes(8).toString('hex');
+const salt = crypto.randomBytes(16).toString('hex');
+const commitField = poseidon([BigInt(uidHash), BigInt(rank), BigInt(nonce), BigInt(salt)]);
+// sign the commit
+const signer = new ethers.Wallet(ISSUER_PRIVATE_KEY);
+const sig = await signer.signMessage(ethers.utils.arrayify(commitField_hex));
+const credential = { commit: commitField_hex, rank, nonce, sig, issuerPub: signer.address };
+```
+
+**Store credential blob** (issuer may return `salt` and `nonce` to player via secure channel). The **issuer should not expose `uidHash`**; only the player will use uidHash and salt to create the ZK proof privately.
+
+**Publish credential metadata** (commit + signature) to Walrus so validators can later check the issuer signature if needed.
+
+---
+
+### Step 3 — player: generate proof & upload blob to Walrus
+
+**Player-side steps (React app):**
+
+1. Player receives `nonce` and `salt` securely from issuer (or generates `salt` and sends commit to issuer during issuance flow — choose a secure issuance method).
+2. Generate witness for circom wasm:
+
+   * Create `input.json` for witness with private `uidHash`, `rank`, `nonce`, `salt` and public `commit`, `minRank`, `maxRank`.
+3. Run `node generate_witness.js` (wasm produced by circom) + `snarkjs` to produce `proof.json` and `public.json`.
+
+Example `generate_proof.sh` (client):
+
+```bash
+# after circom build, you have ./build/rank_proof_js and rank_proof.wasm
+node build/rank_proof_js/generate_witness.js build/rank_proof_js/rank_proof.wasm input.json witness.wtns
+npx snarkjs groth16 prove rank_zkey.zkey witness.wtns proof.json public.json
+```
+
+4. Upload `proof.json` (and optionally the program/ELF or verifier data) to Walrus using Walrus SDK / Tusky SDK.
+
+Example using Tusky / Walrus TypeScript SDK (Node):
+
+```js
+// using Tusky SDK example
+import { Tusky } from "@tusky-io/ts-sdk";
+const tusky = await Tusky.init({ apiKey: process.env.TUSKY_API_KEY });
+const uploadRes = await tusky.uploadFile(Buffer.from(JSON.stringify({ proof, public })), { filename: 'proof.json' });
+const proofBlobId = uploadRes.blobId; // save this id
+```
+
+Or using the Mysten Walrus SDK read/writeBlob APIs (see docs). ([walrus.xyz][7], [GitHub][8])
+
+5. **Submit proof to Soundness testnet** (so validators fetch blob & attest). Use `soundness-cli send` (example usage) to send a proof by its Walrus blob ID:
+
+```bash
+soundness-cli send \
+  --proof-file <proof-blob-id> \
+  --game fairmatch \
+  --key-name <your-key> \
+  --proving-system groth16 \
+  --payload '{"commit":"0x...","minRank":2000,"maxRank":2400}'
+```
+
+This command (and flags) are in community docs and examples; your `soundness-cli` may have slightly different flag names — check `soundness-cli --help`. ([GitHub][9])
+
+When sent, validators fetch the blob from Walrus (by blobId), verify the proof, and store an attestation object on Sui. The CLI/SDK will return a transaction id / attestation ID you can track. ([Soundness][4])
+
+---
+
+### Step 4 — matchmaker: collect attestations & produce a lobby
+
+**Goal:** matchmaker waits until all player proofs are attested, then assembles the lobby.
+
+Implementation notes:
+
+* Player flow returns `attestation ID` (or matchmaker polls Sui to detect the attestation tied to the proof). Use Sui RPC or `soundness-cli` to query attestation status. You can query Sui events or use the Soundness CLI to fetch status.
+* Once all required attestations are valid and their `public.json` indicates allowed ranks / bracket, create a `lobby.json`:
+
+```json
+{
+  "bracket": "Gold",
+  "minRank": 2000,
+  "maxRank": 2400,
+  "players": [
+    {"playerProofBlob": "<blobId>", "attestationTx": "<sui-tx>"},
+    ...
+  ],
+  "timestamp": 1690000000
+}
+```
+
+* Sign `lobby.json` with the matchmaker or tournament organizer key (so players can verify the lobby came from the matchmaker). Upload `lobby.json` to Walrus; return a `lobbyBlobId`.
+
+Optional stronger trustless step (advanced): create a zk-aggregation proof that proves “for each player listed the attestation exists and attests rank within bracket” and have Soundness attest the **lobby** as a combined object. For the PoC we keep it simpler: rely on **per-player Soundness attestations** + a signed lobby JSON. That still demonstrates transparency because every attestation is independently verifiable. (Later you can implement aggregation/recursive proofs.)
+
+---
+
+### Step 5 — game server fetches lobby + runs match
+
+Game server fetches `lobbyBlobId` from Walrus, checks the matchmaker signature, fetches each player's attestation on Sui (to ensure they are current & valid), then allows players into the match.
+
+---
+
+# Minimal CLI / dev commands (quick start)
+
+1. Install prerequisites (Node, Rust, circom, snarkjs, walrus SDK, soundness CLI) — see Prereqs section above. ([docs.circom.io][5], [npm][3], [GitHub][9])
+
+2. Build the circuit:
+
+```bash
+cd circuits
+circom rank_proof.circom --r1cs --wasm --sym -o build
+# setup zkey etc (snarkjs)
+```
+
+3. Start issuer server:
+
+```bash
+cd issuer
+# env: ISSUER_PRIVATE_KEY, WALRUS_API_KEY
+node issuer-server.js
+```
+
+4. Run player-client (React):
+
+```bash
+cd player-client
+npm install
+npm run dev
+# Use UI to request match, produce proof, upload, send using soundness-cli wrapper (scripts/send_proof.sh)
+```
+
+5. Start matchmaker:
+
+```bash
+cd matchmaker
+node matchmaker.js
+# matchmaker polls Sui / Soundness for attestations and creates lobby when 10 valid attests exist
+```
+
+---
+
+# Example tiny code snippets
+
+**issuer/issue.js (simplified)**
+
+```js
+import { poseidon } from "circomlibjs";
+import { Wallet } from "ethers";
+
+export async function issueCredential(userId, rank) {
+  const uidHash = keccak256(Buffer.from(userId)).slice(2); // hex
+  const nonce = randomHex(16);
+  const salt = randomHex(32);
+  const commit = poseidon([BigInt('0x'+uidHash), BigInt(rank), BigInt('0x'+nonce), BigInt('0x'+salt)]);
+  const commitHex = '0x' + commit.toString(16);
+  const signer = new Wallet(process.env.ISSUER_PRIVATE_KEY);
+  const sig = await signer.signMessage(arrayify(commitHex));
+  const blob = { commit: commitHex, sig, rank, nonce }; // issuer stores blob in Walrus or returns to player
+  return { blob, salt }; // salt returned privately to player
+}
+```
+
+**walrus\_upload.js (Node, Tusky example)**
+
+```js
+import { Tusky } from "@tusky-io/ts-sdk";
+const tusky = await Tusky.init({ apiKey: process.env.TUSKY_API_KEY });
+const res = await tusky.uploadFile(Buffer.from(JSON.stringify(blob)), { filename: "credential.json" });
+console.log("blobId", res.blobId);
+```
+
+(Replace Tusky with @mysten/walrus usage if you prefer the official SDK). ([npm][10])
+
+**proof send wrapper (scripts/send\_proof.sh)**
+
+```bash
+# proof-blob-id passed in from player client
+soundness-cli send \
+  --proof-file $1 \
+  --game fairmatch \
+  --key-name my-key \
+  --proving-system groth16 \
+  --payload "{\"minRank\":2000,\"maxRank\":2400,\"commit\":\"$2\"}"
+```
+
+(See soundness-cli usage examples for exact flags). ([GitHub][9])
+
+---
+
+# How to test / verify
+
+1. Player generates proof, uploads to Walrus → get proofBlobId.
+2. Player runs `soundness-cli send --proof-file <proofBlobId> ...` → CLI returns a tx or attestation ID.
+3. Matchmaker polls Sui for that attestation ID; verifies validator signatures or that the attestation exists on Sui.
+4. Anyone can fetch proof blob from Walrus, fetch attestation from Sui, and run verification with public verification key (rank\_verif\_key.json) to ensure validity.
+
+---
+
+# Milestones (2 week PoC sprint)
+
+**Day 1–2:** environment setup, install Soundness CLI, Walrus SDK, circom, snarkjs. Compile sample circuit. ([GitHub][9], [npm][3])
+**Day 3–5:** implement issuer and player proof generation (end-to-end locally).
+**Day 6–8:** integrate Walrus upload + soundness-cli `send` to submit proof to testnet.
+**Day 9–11:** implement matchmaker to collect attestations and store lobby.
+**Day 12–14:** UI polish, demo, README, quick security checklist.
+
+---
+
+# Security & gotchas (must read)
+
+* **Nonce & replay:** include unique nonce and expiry in credentials and proofs to prevent replay.
+* **Privacy:** ensure the circuit never leaks `uidHash` or sensitive fields. Use hashed user id, not raw ID.
+* **Signer & key security:** issuer keys, matchmaker keys, and relayer keys must be protected. Don’t commit them. Use env vars or a KMS.
+* **Circuit correctness:** test with many edge cases (rank boundary). Use unit tests with `circom_tester`. ([docs.circom.io][11])
+
+---
+
+# Helpful references I used
+
+* Soundness Layer blog / announcement. ([Soundness][1])
+* Soundness Layer GitHub (repo, soundness-cli & soundnessup). ([GitHub][2])
+* Walrus TypeScript SDK docs + Upload Relay guide. ([npm][3], [walrus.xyz][7])
+* Example soundness-cli usage (community README showing `soundness-cli send`). ([GitHub][9])
+* Soundness testnet / “Play ZK” blog (client side proving + Walrus attestation flow). ([Soundness][4])
+
+---
+
+
+

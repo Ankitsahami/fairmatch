@@ -1,0 +1,12 @@
+- [ ] Analyze uploaded content and understand requirements
+- [ ] Plan and design the project structure
+- [ ] Implement the project
+  - [x] Step 0: Repo scaffold
+  - [x] Step 1: Circuit design (rank proof)
+  - [x] Step 2: Issuer (game server) issues credential commitment
+  - [x] Step 3: Player: generate proof & upload blob to Walrus
+  - [x] Step 4: Matchmaker: collect attestations & produce a lobby
+  - [x] Step 5: Game server fetches lobby + runs match
+- [x] Test and deploy the project
+- [ ] Deliver results to user
+

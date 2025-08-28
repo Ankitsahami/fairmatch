@@ -1,0 +1,15 @@
+{
+  "name": "fairmatch-issuer",
+  "version": "1.0.0",
+  "description": "FairMatch Issuer Service",
+  "main": "issue.js",
+  "type": "module",
+  "scripts": {
+    "start": "node issue.js"
+  },
+  "dependencies": {
+    "circomlibjs": "^0.1.0",
+    "ethers": "^5.7.2"
+  }
+}
+
